@@ -63,6 +63,71 @@ def _read_status_field(pid: int, field: str) -> str:
     return ""
 
 
+def _resolve_username(pid: int, uid: str) -> str:
+    """
+    Resolves a numeric UID to a username.
+    First tries the container's own /proc/<pid>/root/etc/passwd,
+    then falls back to returning the raw UID string.
+    """
+    if not uid.isdigit():
+        return uid  # already resolved by psutil
+    try:
+        passwd_path = f"{PROC_PATH}/{pid}/root/etc/passwd"
+        with open(passwd_path, "r") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) >= 3 and parts[2] == uid:
+                    return parts[0]
+    except Exception:
+        pass
+    return uid
+
+
+def _read_ppid(pid: int) -> int:
+    val = _read_status_field(pid, "PPid")
+    try:
+        return int(val)
+    except Exception:
+        return 0
+
+
+def _read_container_id(pid: int) -> str:
+    """Reads Docker container ID from /proc/<pid>/cgroup (supports v1 and v2)."""
+    try:
+        with open(f"{PROC_PATH}/{pid}/cgroup", "r") as f:
+            for line in f:
+                # cgroup v1: 12:memory:/docker/<id>
+                if "/docker/" in line:
+                    part = line.split("/docker/")[-1].strip()
+                    cid = part.split("/")[0]
+                    if len(cid) >= 12:
+                        return cid[:12]
+                # cgroup v2: 0::/system.slice/docker-<id>.scope
+                if "docker-" in line and ".scope" in line:
+                    part = line.split("docker-")[-1].split(".scope")[0].strip()
+                    if len(part) >= 12:
+                        return part[:12]
+    except Exception:
+        pass
+    return ""
+
+
+def build_container_name_map(container_ids: set) -> dict:
+    """Returns {short_id: container_name} for given container IDs via Docker SDK."""
+    if not container_ids:
+        return {}
+    try:
+        import docker
+        client = docker.from_env()
+        result = {}
+        for c in client.containers.list(all=True):
+            if c.short_id in container_ids:
+                result[c.short_id] = c.name
+        return result
+    except Exception:
+        return {}
+
+
 def _parse_python_cmd(cmd: str) -> tuple:
     """
     Парсит команду Python и возвращает (script_name, first_arg).
@@ -168,7 +233,7 @@ def get_processes() -> list:
                 try:
                     username = proc.username()
                 except Exception:
-                    username = "unknown"
+                    username = str(proc.uids().real) if hasattr(proc, "uids") else "unknown"
 
             cmd = _read_cmdline(pid)
             cwd = _read_cwd(pid)
@@ -178,6 +243,8 @@ def get_processes() -> list:
 
             mem_percent = (mem_mb / total_mb * 100) if total_mb > 0 else 0.0
 
+            username = _resolve_username(pid, username)
+
             proc_dict = {
                 "pid": pid,
                 "user": username,
@@ -186,6 +253,8 @@ def get_processes() -> list:
                 "mem_mb": round(mem_mb, 1),
                 "cmd": cmd,
                 "cwd": cwd,
+                "ppid": _read_ppid(pid),
+                "container_id": _read_container_id(pid),
             }
             script_name, _ = _parse_python_cmd(cmd)
             proc_dict["script_name"] = script_name
@@ -310,6 +379,21 @@ def get_top_dirs() -> list:
             })
         except Exception:
             continue
+
+    if not result:
+        # Фолбэк: хотя бы корневой раздел
+        try:
+            stat = os.statvfs("/")
+            total_bytes = stat.f_blocks * stat.f_frsize
+            used_bytes = (stat.f_blocks - stat.f_bfree) * stat.f_frsize
+            result.append({
+                "path": "/",
+                "used_gb": round(used_bytes / 1024 ** 3, 1),
+                "total_gb": round(total_bytes / 1024 ** 3, 1),
+                "percent": round(used_bytes / total_bytes * 100, 1) if total_bytes > 0 else 0,
+            })
+        except Exception:
+            pass
 
     return sorted(result, key=lambda x: x["used_gb"], reverse=True)
 

@@ -12,9 +12,9 @@ from app.monitor.system import (
     get_total_ram, get_processes, get_cpu_avg,
     get_docker_containers, get_docker_container_count,
     get_disk_usage, get_top_dirs, get_uptime_seconds,
+    get_script_key, build_container_name_map,
 )
 from app.monitor.checks import run_all_checks
-from app.monitor.system import get_script_key
 from app.storage.state import load_state, save_state
 from app.utils import progress_bar, format_uptime, fmt_mb
 
@@ -142,6 +142,103 @@ async def cmd_top_cpu(message: Message):
     await message.answer(text or "Нет данных")
 
 
+def _ps_worker_role(cmd: str) -> str:
+    """Extracts the worker role from postgres-like process cmdline."""
+    # "postgres: checkpointer " → "checkpointer"
+    # "postgres: vector idle   " → "vector idle"
+    if ": " in cmd:
+        role = cmd.split(": ", 1)[1].strip()
+        # Trim trailing spaces from roles like "vector idle   "
+        role = " ".join(role.split())
+        return role if role else "worker"
+    return cmd.strip()
+
+
+def _ps_grouped_output(found: list, container_map: dict) -> list:
+    """
+    Returns lines for grouped display when many worker-processes are found.
+    Groups by parent PID: main process → its workers.
+    """
+    pid_set = {p["pid"] for p in found}
+    all_procs_by_pid = {p["pid"]: p for p in found}
+
+    # Identify main processes: ppid is NOT in found set
+    mains = [p for p in found if p["ppid"] not in pid_set]
+    # Workers: ppid IS a pid in found set
+    workers_by_ppid: dict = {}
+    for p in found:
+        if p["ppid"] in pid_set:
+            workers_by_ppid.setdefault(p["ppid"], []).append(p)
+
+    # Ungrouped: no main found for them and not a main themselves
+    main_pids = {p["pid"] for p in mains}
+    ungrouped = [
+        p for p in found
+        if p["pid"] not in main_pids and p["ppid"] not in pid_set
+    ]
+
+    lines = []
+
+    for main in mains:
+        container_name = container_map.get(main["container_id"], "")
+        container_str = f" | 🐳 {container_name}" if container_name else (
+            f" | 🐳 {main['container_id']}" if main["container_id"] else ""
+        )
+
+        uptime_str = ""
+        try:
+            p = psutil.Process(main["pid"])
+            uptime_str = f"⏱ {format_uptime(time.time() - p.create_time())}"
+        except Exception:
+            pass
+
+        lines.append(
+            f"🐘 PID {main['pid']} (main){container_str}\n"
+            f"   RAM: {main['mem_percent']}% ({fmt_mb(main['mem_mb'])}) | CPU: {main['cpu_percent']}%"
+            + (f" | {uptime_str}" if uptime_str else "")
+        )
+
+        workers = workers_by_ppid.get(main["pid"], [])
+        if workers:
+            total_ram_mb = sum(w["mem_mb"] for w in workers)
+            total_ram_pct = round(sum(w["mem_percent"] for w in workers), 1)
+
+            # Collect unique roles
+            roles = []
+            seen_roles = set()
+            for w in workers:
+                role = _ps_worker_role(w["cmd"])
+                # Shorten connection roles like "user dbname [local] idle" → "user@dbname"
+                if len(role) > 30:
+                    role = role[:28] + "…"
+                if role not in seen_roles:
+                    seen_roles.add(role)
+                    roles.append(role)
+
+            lines.append(
+                f"   Воркеров: {len(workers)} | RAM итого: {total_ram_pct}% ({fmt_mb(total_ram_mb)})\n"
+                f"   Роли: {', '.join(roles[:8])}"
+                + (" ..." if len(roles) > 8 else "")
+            )
+        lines.append("")
+
+    if ungrouped:
+        lines.append("Без группы:")
+        for p in ungrouped:
+            role = _ps_worker_role(p["cmd"]) if ":" in p["cmd"] else p["script_name"]
+            uptime_str = ""
+            try:
+                proc = psutil.Process(p["pid"])
+                uptime_str = f" | ⏱ {format_uptime(time.time() - proc.create_time())}"
+            except Exception:
+                pass
+            lines.append(
+                f"  PID {p['pid']} | {role} | RAM: {p['mem_percent']}% ({fmt_mb(p['mem_mb'])}){uptime_str}"
+            )
+
+    return lines
+
+
 @router.message(Command("ps"))
 async def cmd_ps(message: Message):
     args = message.text.split(maxsplit=1)
@@ -160,46 +257,73 @@ async def cmd_ps(message: Message):
         await message.answer(f'🔍 Поиск: "{query}"\n\nПроцессы не найдены.')
         return
 
-    lines = [f'🔍 Поиск: "{query}"\n\nНайдено {len(found)} процесс(ов):\n']
+    # Resolve container names for all found processes
+    container_ids = {p["container_id"] for p in found if p.get("container_id")}
+    container_map = build_container_name_map(container_ids)
 
-    keys = [get_script_key(p) for p in found]
-    has_duplicate = len(keys) != len(set(keys))
+    # Use grouped display when many same-name workers are found (>= 5 results)
+    pid_set = {p["pid"] for p in found}
+    has_workers = any(p["ppid"] in pid_set for p in found)
+    use_grouped = len(found) >= 5 and has_workers
 
-    for proc in found:
-        uptime_str = "неизвестно"
-        try:
-            p = psutil.Process(proc["pid"])
-            uptime_str = format_uptime(time.time() - p.create_time())
-        except Exception:
-            pass
+    if use_grouped:
+        header = f'🔍 Поиск: "{query}"\n\nНайдено {len(found)} процесс(ов):\n'
+        body_lines = _ps_grouped_output(found, container_map)
+        text = header + "\n".join(body_lines)
+    else:
+        keys = [get_script_key(p) for p in found]
+        has_duplicate = len(keys) != len(set(keys))
 
-        lines.append(
-            f"PID {proc['pid']} | {proc['script_name']}\n"
-            f"📁 {proc['cwd']}\n"
-            f"RAM: {proc['mem_percent']}% ({fmt_mb(proc['mem_mb'])}) | CPU: {proc['cpu_percent']}% | ⏱ {uptime_str}\n"
-            f"Пользователь: {proc['user']}\n"
-        )
+        lines = [f'🔍 Поиск: "{query}"\n\nНайдено {len(found)} процесс(ов):\n']
+        for proc in found:
+            uptime_str = "неизвестно"
+            try:
+                p = psutil.Process(proc["pid"])
+                uptime_str = format_uptime(time.time() - p.create_time())
+            except Exception:
+                pass
 
-    if has_duplicate:
-        lines.append("⚠️ Обнаружен дубликат!")
+            container_name = container_map.get(proc.get("container_id", ""), "")
+            container_str = f"\n🐳 {container_name}" if container_name else (
+                f"\n🐳 {proc['container_id']}" if proc.get("container_id") else ""
+            )
+            cwd_str = proc["cwd"] if proc["cwd"] != "unknown" else ""
+            cwd_line = f"\n📁 {cwd_str}" if cwd_str else ""
 
-    text = "\n".join(lines)
+            lines.append(
+                f"PID {proc['pid']} | {proc['script_name']}"
+                f"{cwd_line}{container_str}\n"
+                f"RAM: {proc['mem_percent']}% ({fmt_mb(proc['mem_mb'])}) | CPU: {proc['cpu_percent']}% | ⏱ {uptime_str}\n"
+                f"Пользователь: {proc['user']}\n"
+            )
+
+        if has_duplicate:
+            lines.append("⚠️ Обнаружен дубликат!")
+        text = "\n".join(lines)
+
     if len(text) > 4096:
         text = text[:4090] + "\n..."
 
-    # Inline kill buttons — only for admins
+    # Inline kill buttons — only for admins, only for main/ungrouped processes
     kb = None
     if message.from_user and message.from_user.id in ADMIN_IDS and found:
-        buttons = [
-            InlineKeyboardButton(
-                text=f"🔴 Убить PID {p['pid']}",
-                callback_data=f"kill:{p['pid']}",
-            )
-            for p in found[:10]
-        ]
-        # Pair up buttons in rows of 2
-        rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-        kb = InlineKeyboardMarkup(inline_keyboard=rows)
+        if use_grouped:
+            # Only show kill buttons for main processes
+            pid_set_found = {p["pid"] for p in found}
+            kill_targets = [p for p in found if p["ppid"] not in pid_set_found][:10]
+        else:
+            kill_targets = found[:10]
+
+        if kill_targets:
+            buttons = [
+                InlineKeyboardButton(
+                    text=f"🔴 Убить PID {p['pid']}",
+                    callback_data=f"kill:{p['pid']}",
+                )
+                for p in kill_targets
+            ]
+            rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+            kb = InlineKeyboardMarkup(inline_keyboard=rows)
 
     await message.answer(text, reply_markup=kb)
 
@@ -312,8 +436,7 @@ async def cmd_disk(message: Message):
         f"Свободно: {disk['free_gb']} GB",
     ]
 
-    # Показываем разделы только если их больше одного
-    if len(partitions) > 1:
+    if partitions:
         lines.append("\n📁 Разделы по использованию:")
         for i, p in enumerate(partitions, 1):
             p_bar = progress_bar(p["percent"])
