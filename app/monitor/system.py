@@ -1,5 +1,4 @@
 import os
-import subprocess
 import time
 import psutil
 from app.config import PROC_PATH
@@ -64,31 +63,63 @@ def _read_status_field(pid: int, field: str) -> str:
     return ""
 
 
-def _parse_script_and_arg(cmd: str) -> tuple:
-    """Returns (script_name, first_arg) parsed from cmdline string."""
+def _parse_python_cmd(cmd: str) -> tuple:
+    """
+    Парсит команду Python и возвращает (script_name, first_arg).
+
+    Обрабатывает форматы:
+      python script.py arg1          -> ("script.py", "arg1")
+      python -m module.name arg1     -> ("module.name", "arg1")
+      python /full/path/script.py    -> ("script.py", "")
+    """
     parts = cmd.split()
     script_name = None
     first_arg = ""
-    for i, part in enumerate(parts):
-        if "python" in part.lower():
+    i = 0
+
+    while i < len(parts):
+        part = parts[i]
+
+        # Пропускаем интерпретатор python
+        if "python" in part.lower() and (
+            part.endswith("python")
+            or part.endswith("python3")
+            or "python3." in part
+            or "python2." in part
+        ):
+            i += 1
             continue
-        if part.startswith("-"):
-            continue
-        if script_name is None:
-            script_name = os.path.basename(part)
-            if i + 1 < len(parts) and not parts[i + 1].startswith("-"):
-                first_arg = parts[i + 1]
+
+        # Флаг -m: следующий элемент — имя модуля
+        if part == "-m":
+            if i + 1 < len(parts):
+                script_name = parts[i + 1]
+                if i + 2 < len(parts) and not parts[i + 2].startswith("-"):
+                    first_arg = parts[i + 2]
             break
+
+        # Пропускаем прочие флаги (-u, -W, -O и т.д.)
+        if part.startswith("-"):
+            i += 1
+            continue
+
+        # Первое оставшееся — скрипт
+        script_name = os.path.basename(part)
+        if i + 1 < len(parts) and not parts[i + 1].startswith("-"):
+            first_arg = parts[i + 1]
+        break
+
     if not script_name:
         script_name = parts[0] if parts else "unknown"
+
     return script_name, first_arg
 
 
 def get_display_name(process: dict) -> str:
     cmd = process.get("cmd", "")
     cwd = process.get("cwd", "unknown")
-    script_name, first_arg = _parse_script_and_arg(cmd)
-    cwd_last = os.path.basename(cwd) if cwd != "unknown" else ""
+    script_name, first_arg = _parse_python_cmd(cmd)
+    cwd_last = os.path.basename(cwd) if cwd not in ("unknown", "/") else cwd
     name = script_name
     if first_arg:
         name += f" [{first_arg}]"
@@ -100,7 +131,7 @@ def get_display_name(process: dict) -> str:
 def get_script_key(process: dict) -> str:
     cmd = process.get("cmd", "")
     cwd = process.get("cwd", "unknown")
-    script_name, first_arg = _parse_script_and_arg(cmd)
+    script_name, first_arg = _parse_python_cmd(cmd)
     return f"{script_name}::{cwd}::{first_arg}"
 
 
@@ -156,7 +187,7 @@ def get_processes() -> list:
                 "cmd": cmd,
                 "cwd": cwd,
             }
-            script_name, _ = _parse_script_and_arg(cmd)
+            script_name, _ = _parse_python_cmd(cmd)
             proc_dict["script_name"] = script_name
             proc_dict["display_name"] = get_display_name(proc_dict)
 
@@ -225,23 +256,62 @@ def get_disk_usage() -> dict:
 
 
 def get_top_dirs() -> list:
-    dirs = ["/var/lib/docker", "/home", "/opt", "/var", "/usr", "/tmp"]
+    """
+    Читает смонтированные разделы через /proc/mounts и считает размер
+    каждого через os.statvfs(). Не требует прав доступа к содержимому папок.
+    """
     result = []
-    for d in dirs:
+    seen_devices = set()
+
+    mounts_path = os.path.join(PROC_PATH, "mounts")
+    try:
+        with open(mounts_path, "r") as f:
+            mounts = f.readlines()
+    except Exception:
+        return []
+
+    skip_devices = {
+        "none", "tmpfs", "devtmpfs", "sysfs", "proc",
+        "cgroup", "cgroup2", "devpts", "mqueue", "hugetlbfs",
+        "debugfs", "tracefs", "securityfs", "configfs",
+        "fusectl", "overlay",
+    }
+
+    for line in mounts:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        device = parts[0]
+        mount_point = parts[1]
+
+        if device in skip_devices:
+            continue
+        if mount_point.startswith("/sys") or mount_point.startswith("/proc"):
+            continue
+        if mount_point.startswith("/dev") and mount_point != "/dev":
+            continue
+        if device in seen_devices:
+            continue
+        seen_devices.add(device)
+
         try:
-            out = subprocess.check_output(
-                ["du", "-sb", d],
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-            ).decode()
-            size_bytes = int(out.split()[0])
+            stat = os.statvfs(mount_point)
+            total_bytes = stat.f_blocks * stat.f_frsize
+            used_bytes = (stat.f_blocks - stat.f_bfree) * stat.f_frsize
+
+            if total_bytes < 1 * 1024 ** 3:
+                continue
+
             result.append({
-                "path": d,
-                "size_gb": round(size_bytes / 1024 ** 3, 1),
+                "path": mount_point,
+                "used_gb": round(used_bytes / 1024 ** 3, 1),
+                "total_gb": round(total_bytes / 1024 ** 3, 1),
+                "percent": round(used_bytes / total_bytes * 100, 1) if total_bytes > 0 else 0,
             })
         except Exception:
             continue
-    return sorted(result, key=lambda x: x["size_gb"], reverse=True)
+
+    return sorted(result, key=lambda x: x["used_gb"], reverse=True)
 
 
 def get_uptime_seconds() -> float:

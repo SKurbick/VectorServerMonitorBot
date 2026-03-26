@@ -300,7 +300,7 @@ async def cmd_docker(message: Message):
 @router.message(Command("disk"))
 async def cmd_disk(message: Message):
     disk = get_disk_usage()
-    top_dirs = get_top_dirs()
+    partitions = get_top_dirs()
 
     bar = progress_bar(disk["percent"])
 
@@ -312,10 +312,14 @@ async def cmd_disk(message: Message):
         f"Свободно: {disk['free_gb']} GB",
     ]
 
-    if top_dirs:
-        lines.append("\n📁 Топ папок по размеру:")
-        for i, d in enumerate(top_dirs, 1):
-            lines.append(f"{i}. {d['path']}    {d['size_gb']} GB")
+    # Показываем разделы только если их больше одного
+    if len(partitions) > 1:
+        lines.append("\n📁 Разделы по использованию:")
+        for i, p in enumerate(partitions, 1):
+            p_bar = progress_bar(p["percent"])
+            lines.append(
+                f"{i}. {p['path']}    {p['used_gb']} GB / {p['total_gb']} GB  {p_bar}  {p['percent']}%"
+            )
 
     await message.answer("\n".join(lines))
 
