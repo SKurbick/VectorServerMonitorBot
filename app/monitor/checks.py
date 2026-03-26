@@ -4,19 +4,37 @@ from app.config import (
     RAM_PROCESS_WARN, RAM_PROCESS_CRIT,
     RAM_TOTAL_WARN, RAM_TOTAL_CRIT,
     CPU_PROCESS_WARN, CPU_PROCESS_CRIT,
-    REPEAT_ALERT_MIN,
+    REPEAT_ALERT_MIN, DUPLICATE_MIN_RAM_MB,
 )
 
 DUPLICATE_WHITELIST = [
+    # Celery — намеренно много воркеров
     "celery",
-    "nginx: worker",
+    # Nginx — master + workers
+    "nginx",
+    # Docker
     "containerd-shim",
+    "docker-proxy",
+    # Python multiprocessing
     "python -c",
     "python3 -c",
     "spawn_main",
-    "postgres:",
-    "gunicorn",
+    "resource_tracker",
+    # Базы данных
+    "postgres",
+    "redis-server",
+    # Системные процессы
+    "systemd",
+    "sshd",
+    "CRON",
+    "cron",
+    "-bash",
+    "bash",
+    "sh ",
+    "/bin/sh",
+    # Uvicorn/Gunicorn воркеры
     "uvicorn",
+    "gunicorn",
 ]
 
 
@@ -96,6 +114,10 @@ def check_duplicates(processes: list, state: dict) -> list:
 
     for script_key, procs in groups.items():
         if len(procs) < 2:
+            continue
+
+        total_ram_mb = sum(p["mem_mb"] for p in procs)
+        if total_ram_mb < DUPLICATE_MIN_RAM_MB:
             continue
 
         alert_key = f"dup_{script_key}"

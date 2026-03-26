@@ -6,6 +6,7 @@ services:
     pid: host
     volumes:
       - /proc:/host/proc:ro
+      - /var/run/docker.sock:/var/run/docker.sock
       - ./data:/app/data
     env_file:
       - .env

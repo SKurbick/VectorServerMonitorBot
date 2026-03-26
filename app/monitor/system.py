@@ -1,4 +1,6 @@
 import os
+import subprocess
+import time
 import psutil
 from app.config import PROC_PATH
 
@@ -62,52 +64,43 @@ def _read_status_field(pid: int, field: str) -> str:
     return ""
 
 
-def _build_display_name(script_name: str, cwd: str, cmd_parts: list) -> str:
-    if cwd and cwd != "unknown":
-        cwd_last = os.path.basename(cwd.rstrip("/"))
-    else:
-        cwd_last = ""
-
-    # Check for first argument (not the interpreter or script itself)
+def _parse_script_and_arg(cmd: str) -> tuple:
+    """Returns (script_name, first_arg) parsed from cmdline string."""
+    parts = cmd.split()
+    script_name = None
     first_arg = ""
-    if len(cmd_parts) > 1:
-        # cmd_parts[0] is interpreter or script, find the script index
-        # Typical: ["python", "script.py", "arg1"] or ["./script.py", "arg1"]
-        script_idx = -1
-        for i, part in enumerate(cmd_parts):
-            if part == script_name or part.endswith("/" + script_name):
-                script_idx = i
-                break
-        if script_idx >= 0 and script_idx + 1 < len(cmd_parts):
-            candidate = cmd_parts[script_idx + 1]
-            if candidate and not candidate.startswith("-"):
-                first_arg = candidate
+    for i, part in enumerate(parts):
+        if "python" in part.lower():
+            continue
+        if part.startswith("-"):
+            continue
+        if script_name is None:
+            script_name = os.path.basename(part)
+            if i + 1 < len(parts) and not parts[i + 1].startswith("-"):
+                first_arg = parts[i + 1]
+            break
+    if not script_name:
+        script_name = parts[0] if parts else "unknown"
+    return script_name, first_arg
 
-    if first_arg and cwd_last:
-        return f"{script_name} [{first_arg}] ({cwd_last})"
-    elif cwd_last:
-        return f"{script_name} ({cwd_last})"
-    else:
-        return script_name
+
+def get_display_name(process: dict) -> str:
+    cmd = process.get("cmd", "")
+    cwd = process.get("cwd", "unknown")
+    script_name, first_arg = _parse_script_and_arg(cmd)
+    cwd_last = os.path.basename(cwd) if cwd != "unknown" else ""
+    name = script_name
+    if first_arg:
+        name += f" [{first_arg}]"
+    if cwd_last:
+        name += f" ({cwd_last})"
+    return name
 
 
 def get_script_key(process: dict) -> str:
-    script_name = process.get("script_name", "")
-    cwd = process.get("cwd", "")
     cmd = process.get("cmd", "")
-
-    first_arg = ""
-    cmd_parts = cmd.split()
-    script_idx = -1
-    for i, part in enumerate(cmd_parts):
-        if part == script_name or part.endswith("/" + script_name):
-            script_idx = i
-            break
-    if script_idx >= 0 and script_idx + 1 < len(cmd_parts):
-        candidate = cmd_parts[script_idx + 1]
-        if candidate and not candidate.startswith("-"):
-            first_arg = candidate
-
+    cwd = process.get("cwd", "unknown")
+    script_name, first_arg = _parse_script_and_arg(cmd)
     return f"{script_name}::{cwd}::{first_arg}"
 
 
@@ -152,24 +145,9 @@ def get_processes() -> list:
             if not cmd:
                 continue
 
-            cmd_parts = cmd.split()
-            script_name = ""
-
-            # Determine script name from cmdline
-            for part in cmd_parts:
-                if part.endswith(".py") or (
-                    not part.startswith("-") and "/" in part and not part.startswith("/usr") and not part.startswith("/bin")
-                ):
-                    script_name = os.path.basename(part)
-                    break
-            if not script_name:
-                script_name = os.path.basename(cmd_parts[0]) if cmd_parts else ""
-
             mem_percent = (mem_mb / total_mb * 100) if total_mb > 0 else 0.0
 
-            display_name = _build_display_name(script_name, cwd, cmd_parts)
-
-            result.append({
+            proc_dict = {
                 "pid": pid,
                 "user": username,
                 "cpu_percent": round(cpu_percent, 1),
@@ -177,9 +155,12 @@ def get_processes() -> list:
                 "mem_mb": round(mem_mb, 1),
                 "cmd": cmd,
                 "cwd": cwd,
-                "script_name": script_name,
-                "display_name": display_name,
-            })
+            }
+            script_name, _ = _parse_script_and_arg(cmd)
+            proc_dict["script_name"] = script_name
+            proc_dict["display_name"] = get_display_name(proc_dict)
+
+            result.append(proc_dict)
         except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
             continue
         except Exception:
@@ -213,3 +194,62 @@ def get_docker_container_count() -> int:
         return count
     except Exception:
         return 0
+
+
+def get_docker_containers() -> list:
+    """Returns list of container dicts via Docker SDK. Returns None if Docker unavailable."""
+    try:
+        import docker
+        client = docker.from_env()
+        containers = client.containers.list(all=True)
+        result = []
+        for c in containers:
+            result.append({
+                "name": c.name,
+                "status": c.status,
+                "short_id": c.short_id,
+            })
+        return result
+    except Exception:
+        return None
+
+
+def get_disk_usage() -> dict:
+    usage = psutil.disk_usage("/")
+    return {
+        "total_gb": round(usage.total / 1024 ** 3, 1),
+        "used_gb": round(usage.used / 1024 ** 3, 1),
+        "free_gb": round(usage.free / 1024 ** 3, 1),
+        "percent": usage.percent,
+    }
+
+
+def get_top_dirs() -> list:
+    dirs = ["/var/lib/docker", "/home", "/opt", "/var", "/usr", "/tmp"]
+    result = []
+    for d in dirs:
+        try:
+            out = subprocess.check_output(
+                ["du", "-sb", d],
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            ).decode()
+            size_bytes = int(out.split()[0])
+            result.append({
+                "path": d,
+                "size_gb": round(size_bytes / 1024 ** 3, 1),
+            })
+        except Exception:
+            continue
+    return sorted(result, key=lambda x: x["size_gb"], reverse=True)
+
+
+def get_uptime_seconds() -> float:
+    try:
+        with open(f"{PROC_PATH}/uptime", "r") as f:
+            return float(f.read().split()[0])
+    except Exception:
+        try:
+            return time.time() - psutil.boot_time()
+        except Exception:
+            return 0.0

@@ -22,3 +22,8 @@ CHECK_INTERVAL_MIN = int(os.getenv("CHECK_INTERVAL_MIN", "2"))
 STATE_FILE = os.getenv("STATE_FILE", "/app/data/monitor_state.json")
 
 PROC_PATH = os.getenv("PROC_PATH", "/proc")
+
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+
+# Минимальное суммарное потребление RAM группы дублей для алерта (MB)
+DUPLICATE_MIN_RAM_MB = int(os.getenv("DUPLICATE_MIN_RAM_MB", "50"))
