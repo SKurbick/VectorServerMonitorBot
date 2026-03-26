@@ -1,0 +1,20 @@
+# Секреты
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Данные монитора
+data/
+
+# Docker
+*.log
+EOF
