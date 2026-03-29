@@ -1,9 +1,9 @@
 import os
+import re
+import subprocess
 import time
 import psutil
 from app.config import PROC_PATH
-
-psutil.PROCFS_PATH = PROC_PATH
 
 
 def get_total_ram() -> dict:
@@ -46,10 +46,55 @@ def _read_cmdline(pid: int) -> str:
 
 
 def _read_cwd(pid: int) -> str:
+    """
+    Читает реальный рабочий каталог процесса.
+
+    Для процессов хоста — читает напрямую из /proc/<pid>/cwd.
+    Для процессов внутри Docker-контейнеров — получает имя контейнера
+    через cgroup и Docker API.
+    """
     try:
-        return os.readlink(f"{PROC_PATH}/{pid}/cwd")
+        return os.readlink(f"/proc/{pid}/cwd")
+    except PermissionError:
+        return _get_container_name_from_cgroup(pid)
     except Exception:
         return "unknown"
+
+
+def _get_container_name_from_cgroup(pid: int) -> str:
+    """
+    Извлекает имя Docker-контейнера из cgroup файла процесса.
+
+    Пример строки в /proc/<pid>/cgroup:
+    0::/system.slice/docker-aa77ce97eeb619d4edcc47e804df8988cbfb3016040be450a39e14c8093601f9.scope
+
+    Возвращает строку вида "[docker] vector_project_container"
+    или "container" если не удалось определить имя.
+    """
+    try:
+        with open(f"/proc/{pid}/cgroup", "r") as f:
+            content = f.read()
+
+        match = re.search(r"docker-([a-f0-9]{12,64})\.scope", content)
+        if not match:
+            return "container"
+
+        container_id = match.group(1)
+
+        result = subprocess.run(
+            ["/usr/bin/docker", "inspect", "--format", "{{.Name}}", container_id],
+            capture_output=True,
+            text=True,
+            timeout=3
+        )
+        if result.returncode == 0:
+            name = result.stdout.strip().lstrip("/")
+            return f"[docker] {name}"
+
+        return "container"
+
+    except Exception:
+        return "container"
 
 
 def _read_status_field(pid: int, field: str) -> str:
@@ -324,41 +369,48 @@ def get_disk_usage() -> dict:
     }
 
 
-def get_top_dirs() -> list:
+def get_top_dirs() -> list[dict]:
     """
-    Читает смонтированные разделы через /proc/mounts и считает размер
-    каждого через os.statvfs(). Не требует прав доступа к содержимому папок.
+    Читает смонтированные разделы через /proc/mounts
+    и считает размер каждого через os.statvfs().
+    Не требует прав доступа к содержимому папок.
     """
     result = []
     seen_devices = set()
 
-    mounts_path = os.path.join(PROC_PATH, "mounts")
+    SKIP_FS_TYPES = {
+        "tmpfs", "devtmpfs", "sysfs", "proc", "cgroup", "cgroup2",
+        "devpts", "mqueue", "hugetlbfs", "debugfs", "tracefs",
+        "securityfs", "configfs", "fusectl", "overlay", "none",
+        "nsfs", "bpf", "pstore", "autofs"
+    }
+
     try:
-        with open(mounts_path, "r") as f:
+        with open("/proc/mounts", "r") as f:
             mounts = f.readlines()
     except Exception:
         return []
 
-    skip_devices = {
-        "none", "tmpfs", "devtmpfs", "sysfs", "proc",
-        "cgroup", "cgroup2", "devpts", "mqueue", "hugetlbfs",
-        "debugfs", "tracefs", "securityfs", "configfs",
-        "fusectl", "overlay",
-    }
-
     for line in mounts:
         parts = line.split()
-        if len(parts) < 2:
+        if len(parts) < 3:
             continue
+
         device = parts[0]
         mount_point = parts[1]
+        fs_type = parts[2]
 
-        if device in skip_devices:
+        if fs_type in SKIP_FS_TYPES:
             continue
-        if mount_point.startswith("/sys") or mount_point.startswith("/proc"):
+        if mount_point.startswith("/sys"):
             continue
-        if mount_point.startswith("/dev") and mount_point != "/dev":
+        if mount_point.startswith("/proc"):
             continue
+        if mount_point.startswith("/dev/") or mount_point == "/dev":
+            continue
+        if mount_point.startswith("/run/"):
+            continue
+
         if device in seen_devices:
             continue
         seen_devices.add(device)
@@ -375,25 +427,10 @@ def get_top_dirs() -> list:
                 "path": mount_point,
                 "used_gb": round(used_bytes / 1024 ** 3, 1),
                 "total_gb": round(total_bytes / 1024 ** 3, 1),
-                "percent": round(used_bytes / total_bytes * 100, 1) if total_bytes > 0 else 0,
+                "percent": round(used_bytes / total_bytes * 100, 1)
             })
         except Exception:
             continue
-
-    if not result:
-        # Фолбэк: хотя бы корневой раздел
-        try:
-            stat = os.statvfs("/")
-            total_bytes = stat.f_blocks * stat.f_frsize
-            used_bytes = (stat.f_blocks - stat.f_bfree) * stat.f_frsize
-            result.append({
-                "path": "/",
-                "used_gb": round(used_bytes / 1024 ** 3, 1),
-                "total_gb": round(total_bytes / 1024 ** 3, 1),
-                "percent": round(used_bytes / total_bytes * 100, 1) if total_bytes > 0 else 0,
-            })
-        except Exception:
-            pass
 
     return sorted(result, key=lambda x: x["used_gb"], reverse=True)
 
